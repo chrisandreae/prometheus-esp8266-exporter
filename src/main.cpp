@@ -1,9 +1,12 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
-#include <DHTesp.h>
+#include <Wire.h>
+#include <Adafruit_INA219.h>
 
 #include "config.h"
 #include "version.h"
+
+Adafruit_INA219 ina219;
 
 #define EXPLODE4(arr) (arr[0], arr[1], arr[2], arr[3])
 
@@ -13,25 +16,29 @@ enum LogLevel {
     ERROR,
 };
 
-void setup_dht_sensor();
+void setup_sensor();
 void setup_wifi();
 void setup_http_server();
+void handle_http_root();
+void handle_http_not_found();
 void handle_http_home_client();
-void handle_http_metrics_client();
+void handle_http_metrics();
 void read_sensors(boolean force=false);
 bool read_sensor(float (*function)(), float *value);
+void log_request();
 void log(char const *message, LogLevel level=LogLevel::INFO);
 
-DHTesp dht_sensor;
 ESP8266WebServer http_server(HTTP_SERVER_PORT);
 
-float humidity, temperature, heat_index;
+float busvoltage = 0;
+float current_mA = 0;
+
 uint32_t previous_read_time = 0;
 
 void setup(void) {
     char message[128];
-    Serial.begin(9600);
-    setup_dht_sensor();
+    Serial.begin(76800);
+    setup_sensor();
     setup_wifi();
     setup_http_server();
     snprintf(message, 128, "Prometheus namespace: %s", PROM_NAMESPACE);
@@ -39,13 +46,17 @@ void setup(void) {
     log("Setup done");
 }
 
-void setup_dht_sensor() {
-    log("Setting up DHT sensor");
-    dht_sensor.setup(DHT_PIN, DHTesp::DHT_TYPE);
-    delay(dht_sensor.getMinimumSamplingPeriod());
+void setup_sensor() {
+    log("Setting up sensor");
+
+    if (! ina219.begin()) {
+        Serial.println("Failed to find INA219 chip");
+        while (1) { delay(10); }
+    }
+
     // Test read
     read_sensors(true);
-    log("DHT sensor ready", LogLevel::DEBUG);
+    log("sensor ready", LogLevel::DEBUG);
 }
 
 void setup_wifi() {
@@ -145,27 +156,23 @@ void handle_http_metrics() {
         "# TYPE " PROM_NAMESPACE "_info gauge\n"
         "# UNIT " PROM_NAMESPACE "_info \n"
         PROM_NAMESPACE "_info{version=\"%s\",board=\"%s\",sensor=\"%s\"} 1\n"
-        "# HELP " PROM_NAMESPACE "_air_humidity_percent Air humidity.\n"
-        "# TYPE " PROM_NAMESPACE "_air_humidity_percent gauge\n"
-        "# UNIT " PROM_NAMESPACE "_air_humidity_percent %%\n"
-        PROM_NAMESPACE "_air_humidity_percent %f\n"
-        "# HELP " PROM_NAMESPACE "_air_temperature_celsius Air temperature.\n"
-        "# TYPE " PROM_NAMESPACE "_air_temperature_celsius gauge\n"
-        "# UNIT " PROM_NAMESPACE "_air_temperature_celsius \u00B0C\n"
-        PROM_NAMESPACE "_air_temperature_celsius %f\n"
-        "# HELP " PROM_NAMESPACE "_air_heat_index_celsius Apparent air temperature, based on temperature and humidity.\n"
-        "# TYPE " PROM_NAMESPACE "_air_heat_index_celsius gauge\n"
-        "# UNIT " PROM_NAMESPACE "_air_heat_index_celsius \u00B0C\n"
-        PROM_NAMESPACE "_air_heat_index_celsius %f\n";
+        "# HELP " PROM_NAMESPACE "_battery_voltage Battery Voltage.\n"
+        "# TYPE " PROM_NAMESPACE "_battery_voltage gauge\n"
+        "# UNIT " PROM_NAMESPACE "_battery_voltage V\n"
+        PROM_NAMESPACE "_battery_voltage %f\n"
+        "# HELP " PROM_NAMESPACE "_battery_current Battery Current.\n"
+        "# TYPE " PROM_NAMESPACE "_battery_current gauge\n"
+        "# UNIT " PROM_NAMESPACE "_battery_current mA\n"
+        PROM_NAMESPACE "_battery_current %f\n";
 
     read_sensors();
-    if (isnan(humidity) || isnan(temperature) || isnan(heat_index)) {
+    if (isnan(busvoltage) || isnan(current_mA)) {
         http_server.send(500, "text/plain; charset=utf-8", "Sensor error.");
         return;
     }
 
     char response[BUFSIZE];
-    snprintf(response, BUFSIZE, response_template, VERSION, BOARD_NAME, DHT_NAME, humidity, temperature, heat_index);
+    snprintf(response, BUFSIZE, response_template, VERSION, BOARD_NAME, SENSOR_NAME, busvoltage, current_mA);
     http_server.send(200, "text/plain; charset=utf-8", response);
 }
 
@@ -174,50 +181,33 @@ void handle_http_not_found() {
     http_server.send(404, "text/plain; charset=utf-8", "Not found.");
 }
 
-void read_sensors(boolean force) {
-    uint32_t min_interval = max(dht_sensor.getMinimumSamplingPeriod(), READ_INTERVAL);
-    uint32_t current_time = millis();
-    if (!force && current_time - previous_read_time < min_interval) {
-        log("Sensors were recently read, will not read again yet.", LogLevel::DEBUG);
-        return;
+
+void read_voltage_sensor() {
+    log("Reading voltage sensor ...", LogLevel::DEBUG);
+    bool result = read_sensor([] {
+          return ina219.getBusVoltage_V();
+      }, &busvoltage);
+    if (!result) {
+        log("Failed to read voltage sensor.", LogLevel::ERROR);
     }
+}
+
+void read_current_sensor() {
+    log("Reading current sensor ...", LogLevel::DEBUG);
+    bool result = read_sensor([] {
+        return ina219.getCurrent_mA();
+    }, &current_mA);
+    if (!result) {
+        log("Failed to read current sensor.", LogLevel::ERROR);
+    }
+}
+
+void read_sensors(boolean force) {
+    uint32_t current_time = millis();
     previous_read_time = current_time;
 
-    read_humidity_sensor();
-    read_temperature_sensor();
-    read_heat_index();
-}
-
-void read_humidity_sensor() {
-    log("Reading humidity sensor ...", LogLevel::DEBUG);
-    bool result = read_sensor([] {
-          return dht_sensor.getHumidity();
-      }, &humidity);
-    if (result) {
-        humidity += HUMIDITY_CORRECTION_OFFSET;
-    } else {
-        log("Failed to read humidity sensor.", LogLevel::ERROR);
-    }
-}
-
-void read_temperature_sensor() {
-    log("Reading temperature sensor ...", LogLevel::DEBUG);
-    bool result = read_sensor([] {
-        return dht_sensor.getTemperature();
-    }, &temperature);
-    if (result) {
-        temperature += TEMPERATURE_CORRECTION_OFFSET;
-    } else {
-        log("Failed to read temperature sensor.", LogLevel::ERROR);
-    }
-}
-
-void read_heat_index() {
-    if (!isnan(humidity) && !isnan(temperature)) {
-        heat_index = dht_sensor.computeHeatIndex(temperature, humidity, false);
-    } else {
-        heat_index = NAN;
-    }
+    read_voltage_sensor();
+    read_current_sensor();
 }
 
 bool read_sensor(float (*function)(), float *value) {
@@ -233,14 +223,6 @@ bool read_sensor(float (*function)(), float *value) {
     return success;
 }
 
-void log_request() {
-    char message[128];
-    char method_name[16];
-    get_http_method_name(method_name, 16, http_server.method());
-    snprintf(message, 128, "Request: client=%s:%u method=%s path=%s",
-            http_server.client().remoteIP().toString().c_str(), http_server.client().remotePort(), method_name, http_server.uri().c_str());
-    log(message, LogLevel::INFO);
-}
 
 void get_http_method_name(char *name, size_t name_length, HTTPMethod method) {
     switch (method) {
@@ -269,6 +251,15 @@ void get_http_method_name(char *name, size_t name_length, HTTPMethod method) {
         snprintf(name, name_length, "UNKNOWN");
         break;
     }
+}
+
+void log_request() {
+    char message[128];
+    char method_name[16];
+    get_http_method_name(method_name, 16, http_server.method());
+    snprintf(message, 128, "Request: client=%s:%u method=%s path=%s",
+            http_server.client().remoteIP().toString().c_str(), http_server.client().remotePort(), method_name, http_server.uri().c_str());
+    log(message, LogLevel::INFO);
 }
 
 void log(char const *message, LogLevel level) {
